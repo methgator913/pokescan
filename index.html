@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pokéscan</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Pokéscan">
+<meta name="theme-color" content="#14161c">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <section id="scan">
+    <div class="finish" role="group" aria-label="Card finish">
+      <label><input type="checkbox" id="f-holo"> Holo</label>
+      <label><input type="checkbox" id="f-reverse"> Reverse holo</label>
+      <label><input type="checkbox" id="f-first"> 1st edition</label>
+    </div>
+    <label class="scan-btn" id="scan-btn">
+      <input type="file" id="photo" accept="image/*" capture="environment" hidden>
+      Scan card
+    </label>
+    <p class="hint" id="scan-hint">Fill the frame, tilt shiny cards away from the light so the number isn't covered in glare.</p>
+    <form id="search" autocomplete="off">
+      <input id="q" type="search" placeholder="Or search: charizard 4/102" enterkeyhint="search">
+      <button>Search</button>
+    </form>
+    <div id="status" aria-live="polite"></div>
+    <ul id="results"></ul>
+  </section>
+
+  <section id="collection" hidden>
+    <header class="totals"><div><b id="total">$0.00</b><span id="count">0 cards</span></div></header>
+    <div class="tools">
+      <button id="refresh">Refresh prices</button>
+      <button id="csv">Export CSV</button>
+      <button id="json">Backup</button>
+      <label class="btn">Restore<input type="file" id="restore" accept=".json" hidden></label>
+    </div>
+    <ul id="cards"></ul>
+    <details id="settings">
+      <summary>Better scanner (optional, needs a paid key)</summary>
+      <label>Claude scan server URL<input id="s-url" placeholder="https://….workers.dev" autocapitalize="off"></label>
+      <label>Access token<input id="s-token" placeholder="optional" autocapitalize="off"></label>
+    </details>
+  </section>
+</main>
+<div id="toast" role="status"></div>
+<nav>
+  <button data-tab="scan" class="on">Scan</button>
+  <button data-tab="collection">Collection <i id="badge"></i></button>
+</nav>
+<script src="app.js"></script>
+</body>
+</html>

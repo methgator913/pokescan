@@ -1,0 +1,7 @@
+name = "pokescan-id"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+[vars]
+# Only the hosted page may call this Worker.
+ALLOWED_ORIGIN = "https://methgator913.github.io"
