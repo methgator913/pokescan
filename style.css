@@ -32,3 +32,4 @@ nav i{font-style:normal;background:var(--accent);color:var(--on);border-radius:9
 #toast{position:fixed;left:50%;bottom:calc(84px + env(safe-area-inset-bottom));transform:translate(-50%,20px);background:var(--text);color:var(--bg);padding:10px 16px;border-radius:99px;opacity:0;pointer-events:none;transition:.2s}
 #toast.show{opacity:1;transform:translate(-50%,0)}
 [hidden]{display:none!important}
+#dbg{margin-top:14px;color:var(--dim);font-size:13px}#dbg pre{white-space:pre-wrap;word-break:break-word;margin:0;font-size:12px}

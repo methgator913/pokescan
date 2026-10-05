@@ -186,38 +186,173 @@ const cleanName = (line) => line
 
 function parseNumber(text) {
   for (const t of [text, text.replace(/[Oo]/g, "0").replace(/[Il|]/g, "1")]) {
-    const m = t.match(/([A-Za-z]{0,5}\d{1,3}[A-Za-z]{0,2})\s*[\/7]\s*(\d{2,3})\b/) || t.match(/\b([A-Za-z]{2,5}\d{2,3})\b/);
-    if (m) return { number: m[1].toUpperCase(), total: m[2] || "" };
+    let m = t.match(/\b(\d{1,3}[A-Za-z]?)\s*[\/7]\s*(\d{2,3})\b/); // 025/165
+    if (m) return { number: m[1].toUpperCase(), total: m[2] };
+    m = t.match(/\b([A-Za-z]{1,4}\d{1,3})\s*\/\s*([A-Za-z]{1,4}\d{1,3})\b/); // TG05/TG30, GG01/GG70
+    if (m) return { number: m[1].toUpperCase(), total: m[2].replace(/\D/g, "") };
+    m = t.match(/\b((?:SWSH|SVP|SM|XY|BW|DP|HGSS|SV|PR)\d{2,3})\b/i); // promos print no total
+    if (m) return { number: m[1].toUpperCase(), total: "" };
   }
   return { number: "", total: "" };
 }
 
-async function ocrIdentify(file) {
+async function loadPage(file, max = 1800) {
   const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
-  const k = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+  const k = Math.min(1, max / Math.max(bmp.width, bmp.height));
   const page = document.createElement("canvas");
   page.width = Math.round(bmp.width * k); page.height = Math.round(bmp.height * k);
   page.getContext("2d").drawImage(bmp, 0, 0, page.width, page.height);
+  return page;
+}
 
+function rotate(src, deg) {
+  const c = document.createElement("canvas");
+  const swap = deg === 90 || deg === 270;
+  c.width = swap ? src.height : src.width; c.height = swap ? src.width : src.height;
+  const g = c.getContext("2d");
+  g.translate(c.width / 2, c.height / 2); g.rotate((deg * Math.PI) / 180);
+  g.drawImage(src, -src.width / 2, -src.height / 2);
+  return c;
+}
+
+function rotateAny(src, rad, fill) {
+  const sn = Math.abs(Math.sin(rad)), cs = Math.abs(Math.cos(rad));
+  const c = document.createElement("canvas");
+  c.width = Math.ceil(src.width * cs + src.height * sn); c.height = Math.ceil(src.width * sn + src.height * cs);
+  const g = c.getContext("2d"); g.fillStyle = fill; g.fillRect(0, 0, c.width, c.height);
+  g.translate(c.width / 2, c.height / 2); g.rotate(rad); g.drawImage(src, -src.width / 2, -src.height / 2);
+  return c;
+}
+
+/** Find the card in a photo: everything that differs from the background colour (sampled round the frame edge),
+ *  then take the bounding box of the big blob. Returns a crop of the page, or null if nothing card-shaped stands out. */
+function detectCard(page, depth = 0) {
+  const S = 360, k = S / Math.max(page.width, page.height);
+  const w = Math.max(8, Math.round(page.width * k)), h = Math.max(8, Math.round(page.height * k));
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const g = c.getContext("2d", { willReadFrequently: true });
+  g.drawImage(page, 0, 0, w, h);
+  const d = g.getImageData(0, 0, w, h).data;
+  const bx = Math.max(2, Math.round(w * 0.05)), by = Math.max(2, Math.round(h * 0.05));
+  const ring = [[], [], []];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (x >= bx && x < w - bx && y >= by && y < h - by) continue;
+    const i = (y * w + x) * 4; for (let ch = 0; ch < 3; ch++) ring[ch].push(d[i + ch]);
+  }
+  const med = ring.map((a) => a.sort((p, q) => p - q)[a.length >> 1]);
+  const dist = new Uint16Array(w * h), hist = new Uint32Array(766);
+  for (let i = 0; i < w * h; i++) {
+    const v = Math.abs(d[i * 4] - med[0]) + Math.abs(d[i * 4 + 1] - med[1]) + Math.abs(d[i * 4 + 2] - med[2]);
+    dist[i] = v; hist[v]++;
+  }
+  // Otsu threshold on the distance histogram
+  let total = w * h, sum = 0; for (let t = 0; t < 766; t++) sum += t * hist[t];
+  let wB = 0, sB = 0, best = 0, thr = 40;
+  for (let t = 0; t < 766; t++) {
+    wB += hist[t]; if (!wB) continue; const wF = total - wB; if (!wF) break;
+    sB += t * hist[t]; const mB = sB / wB, mF = (sum - sB) / wF, v = wB * wF * (mB - mF) ** 2;
+    if (v > best) { best = v; thr = t; }
+  }
+  thr = Math.max(thr, 35);
+  const row = new Uint16Array(h), col = new Uint16Array(w);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (dist[y * w + x] > thr) { row[y]++; col[x]++; }
+  const mr = Math.max(...row), mc = Math.max(...col);
+  if (mr < 8 || mc < 8) return null;
+  const span = (arr, m) => { let lo = 0, hi = arr.length - 1; while (lo < hi && arr[lo] < 0.4 * m) lo++; while (hi > lo && arr[hi] < 0.4 * m) hi--; return [lo, hi]; };
+  const [y0, y1] = span(row, mr), [x0, x1] = span(col, mc);
+  if (depth === 0) { // a tilted card: measure its angle from the mask's principal axis and straighten the photo first
+    let n = 0, sx = 0, sy = 0;
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) if (dist[y * w + x] > thr) { n++; sx += x; sy += y; }
+    if (n > 50) {
+      const mx = sx / n, my = sy / n; let cxx = 0, cyy = 0, cxy = 0;
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) if (dist[y * w + x] > thr) { cxx += (x - mx) ** 2; cyy += (y - my) ** 2; cxy += (x - mx) * (y - my); }
+      const phi = 0.5 * Math.atan2(2 * cxy, cxx - cyy), tilt = phi > 0 ? phi - Math.PI / 2 : phi + Math.PI / 2, deg = Math.abs(tilt * 180 / Math.PI);
+      if (deg > 1.5 && deg < 30) return detectCard(rotateAny(page, -tilt, `rgb(${med[0]},${med[1]},${med[2]})`), 1);
+    }
+  }
+  const bw = x1 - x0 + 1, bh = y1 - y0 + 1, area = (bw * bh) / (w * h), asp = Math.min(bw, bh) / Math.max(bw, bh);
+  if (area < 0.1 || area > 0.97 || asp < 0.55 || asp > 0.88) return null;
+  const mx = Math.round(bw * 0.015), my = Math.round(bh * 0.015);
+  const sx = Math.max(0, x0 - mx) / k, sy = Math.max(0, y0 - my) / k;
+  const sw = Math.min(w, x1 + mx + 1) / k - sx, sh = Math.min(h, y1 + my + 1) / k - sy;
+  const out = document.createElement("canvas"); out.width = Math.round(sw); out.height = Math.round(sh);
+  out.getContext("2d").drawImage(page, sx, sy, sw, sh, 0, 0, out.width, out.height);
+  return out;
+}
+
+/** Read name (top band) and collector number (bottom bands) off an upright card image. */
+async function readCard(card) {
   const w = await getOcr();
   await w.setParameters({ tessedit_pageseg_mode: "6", tessedit_char_whitelist: "" });
-  const top = (await w.recognize(prep(page, 0.04, 0.02, 0.92, 0.13, 140))).data.text;
-  await w.setParameters({ tessedit_pageseg_mode: "6", tessedit_char_whitelist: "0123456789/ABCDEFGHIJKLMNOPQRSTUVWXYZ " });
-  // The collector number is small and its spot varies by era: try the whole bottom band, then tighter bands per side.
-  let bottom = "", num = { number: "", total: "" };
-  for (const [x, y, bw, bh] of [[0, 0.88, 1, 0.12], [0, 0.915, 0.5, 0.08], [0.5, 0.915, 0.5, 0.08], [0, 0.93, 1, 0.065]]) {
-    const t = (await w.recognize(prep(page, x, y, bw, bh, 120))).data.text;
-    bottom += t + "\n";
-    num = parseNumber(t);
-    if (num.number && num.total) break;
-  }
-
+  const topRes = (await w.recognize(prep(card, 0.04, 0.02, 0.92, 0.13, 140))).data;
+  const top = topRes.text;
   const lines = top.split("\n");
   const names = lines.map(cleanName).filter((l) => (l.match(/[A-Za-z]/g) || []).length >= 3);
   // Evolved cards print "Put <Name> on the Stage N card" in the flavor line: that is the real name.
   const put = top.match(/Put\s+([A-Z][A-Za-zÀ-ÿ'’.\-]+(?:\s+(?:ex|EX|GX|V|VMAX))?)\s+on\s+the/);
   if (put) names.unshift(put[1]);
-  return { names, ...num, raw: { top, bottom } };
+  // wrong way up / not a card: the top band is garbage, so don't waste time on the rest
+  if (!put && topRes.confidence < 40 && !names.some((n) => n.replace(/[^A-Za-z]/g, "").length >= 5)) return { names: [], number: "", total: "", conf: topRes.confidence, raw: { top, bottom: "" } };
+
+  await w.setParameters({ tessedit_pageseg_mode: "6", tessedit_char_whitelist: "0123456789/ABCDEFGHIJKLMNOPQRSTUVWXYZ " });
+  // The collector number is small and its spot varies by era: try the whole bottom band, then tighter bands per side.
+  let bottom = "", num = { number: "", total: "" };
+  for (const [x, y, bw, bh] of [[0, 0.88, 1, 0.12], [0, 0.915, 0.5, 0.08], [0.5, 0.915, 0.5, 0.08], [0, 0.93, 1, 0.065]]) {
+    const t = (await w.recognize(prep(card, x, y, bw, bh, 120))).data.text;
+    bottom += t + "\n";
+    num = parseNumber(t);
+    if (num.number && num.total) break;
+  }
+  return { names, ...num, conf: topRes.confidence, raw: { top, bottom } };
+}
+
+const plausible = (r) => !!(r.number && r.total) || (r.conf >= 45 && r.names.some((n) => n.replace(/[^A-Za-z]/g, "").length >= 4));
+
+/** Yields plausible reads, trying the detected card crop then the whole photo, upright then rotated. */
+async function* ocrReads(file) {
+  const page = await loadPage(file);
+  const card = detectCard(page);
+  const dbg = (window.scanDebug = { found: !!card, tries: [], img: (card || page) });
+  let n = 0;
+  for (const base of card ? [card, page] : [page]) {
+    const rots = base.width > base.height ? [90, 270, 0] : [0, 90, 270];
+    for (const rot of rots) {
+      status(`Reading card… (try ${++n})`);
+      const r = await readCard(rot ? rotate(base, rot) : base);
+      r.rot = rot; r.crop = base === card ? "card" : "photo";
+      dbg.tries.push(`#${n} ${r.crop} rot${rot} conf${Math.round(r.conf)} names=[${r.names.slice(0, 2).join(" // ")}] num=${r.number}/${r.total}`);
+      if (plausible(r)) { window.lastOcr = r; yield r; }
+    }
+  }
+}
+
+/** name / number guesses from one OCR read -> candidate cards. */
+async function resolveRead(r) {
+  // Try whole lines first, then single words (OCR often glues "Stage 2 ... Charizard HP" together), accepting a hit
+  // only if its set size matches the printed total; fall back to a number+total search ranked by name similarity.
+  const STOP = new Set(["stage", "basic", "evolves", "from", "put", "card", "pokemon", "pokémon", "restored", "trainer", "energy"]);
+  const words = [...new Set(r.names.flatMap((l) => l.split(" ")).map((w) => w.replace(/[^A-Za-zÀ-ÿ'’.-]/g, "")).filter((w) => w.length >= 4 && !STOP.has(w.toLowerCase())))];
+  const guesses = [...r.names.slice(0, 2), ...words].slice(0, 7);
+  const numArg = r.total ? `${r.number}/${r.total}` : r.number;
+  let cards = [], weak = [];
+  for (const n of guesses) {
+    const got = await lookup(n, numArg, true).catch(() => []);
+    if (!got.length) continue;
+    if (!r.total || got.some((c) => String(c.set.printedTotal).startsWith(String(+r.total)))) { cards = got; break; }
+    if (!weak.length) weak = got;
+  }
+  if (!cards.length && r.number && r.total) cards = await lookupByNumber(r.number, r.total, r.names).catch(() => []);
+  if (!cards.length && r.total) { // number unreadable: name + set size
+    for (const n of guesses.slice(0, 3)) { const got = sameTotal(await lookup(n, `/${r.total}`).catch(() => []), r.total); if (got.length) { cards = got; break; } }
+  }
+  return cards.length ? cards : weak;
+}
+
+function showDebug() {
+  const d = window.scanDebug; if (!d) return;
+  const box = $("#dbg"); box.hidden = false;
+  const img = $("#dbg-img"); img.innerHTML = ""; d.img.style.cssText = "max-width:140px;border-radius:6px;display:block;margin:8px 0"; img.appendChild(d.img);
+  $("#dbg-txt").textContent = `card found in photo: ${d.found}\n` + d.tries.join("\n");
 }
 
 function similarity(a, b) {
@@ -230,10 +365,26 @@ function similarity(a, b) {
   return 1 - dp[a.length][b.length] / Math.max(a.length, b.length);
 }
 
+let setTotals;
+/** set id -> printed totals ("official" and "total"), fetched once. Lets a number search drop every card from a set of the wrong size
+ *  before spending a request per candidate. */
+async function getSetTotals() {
+  if (!setTotals) {
+    const sets = (await getJSON(`${DEX}/sets`).catch(() => null)) || [];
+    setTotals = new Map(sets.map((x) => [x.id, [x.cardCount?.official, x.cardCount?.total].filter(Boolean).map(String)]));
+  }
+  return setTotals;
+}
+
 /** Number + set size pins down a handful of cards; rank them by how close their name is to the (possibly garbled) OCR names. */
 async function lookupByNumber(number, total, guesses) {
-  const briefs = await list({ localId: number, "pagination:itemsPerPage": 1000 });
-  const cards = sameTotal(exactNum(await getCards(briefRank(briefs, guesses)), number), total);
+  let briefs = (await list({ localId: number, "pagination:itemsPerPage": 1000 })).filter((b) => normNum(b.localId) === normNum(number));
+  const st = await getSetTotals(), t = String(+total);
+  const setOf = (b) => b.id.slice(0, b.id.length - String(b.localId).length - 1);
+  const exact = briefs.filter((b) => (st.get(setOf(b)) || []).includes(t));
+  const prefix = t.length >= 2 ? briefs.filter((b) => (st.get(setOf(b)) || []).some((x) => x.startsWith(t))) : [];
+  const pool = exact.length ? exact : prefix.length ? prefix : briefs;
+  const cards = sameTotal(await getCards(briefRank(pool, guesses)), total);
   return byScore(cards, guesses).slice(0, 6);
 }
 
@@ -280,28 +431,14 @@ async function onPhoto(file) {
       return;
     }
     status(ocrWorker ? "Reading card…" : "Reading card… (the first scan downloads the text reader, about 10 MB)");
-    const r = await ocrIdentify(file);
-    window.lastOcr = r;
-    if (!r.names.length && !r.number) { status("Couldn't read that card. Fill the frame, tilt away from glare, or use search."); return; }
-    status(`Read: ${r.names[0] || "?"} ${r.number ? r.number + (r.total ? "/" + r.total : "") : ""}. Looking up…`);
-    // Try whole lines first, then single words (OCR often glues "Stage 2 ... Charizard HP" together), accepting a hit
-    // only if its set size matches the printed total; fall back to a number+total search ranked by name similarity.
-    const STOP = new Set(["stage", "basic", "evolves", "from", "put", "card", "pokemon", "pokémon", "restored", "trainer", "energy"]);
-    const words = [...new Set(r.names.flatMap((l) => l.split(" ")).map((w) => w.replace(/[^A-Za-zÀ-ÿ'’.-]/g, "")).filter((w) => w.length >= 4 && !STOP.has(w.toLowerCase())))];
-    const guesses = [...r.names.slice(0, 2), ...words].slice(0, 7);
-    const numArg = r.total ? `${r.number}/${r.total}` : r.number;
-    let cards = [], weak = [];
-    for (const n of guesses) {
-      const got = await lookup(n, numArg, true).catch(() => []);
-      if (!got.length) continue;
-      if (!r.total || got.some((c) => String(c.set.printedTotal).startsWith(String(+r.total)))) { cards = got; break; }
-      if (!weak.length) weak = got;
+    let cards = [];
+    for await (const r of ocrReads(file)) {
+      status(`Read: ${r.names[0] || "?"} ${r.number ? r.number + (r.total ? "/" + r.total : "") : ""}. Looking up…`);
+      cards = await resolveRead(r);
+      if (cards.length) break;
     }
-    if (!cards.length && r.number && r.total) cards = await lookupByNumber(r.number, r.total, r.names).catch(() => []);
-    if (!cards.length && r.total) { // number unreadable: name + set size
-      for (const n of guesses.slice(0, 3)) { const got = sameTotal(await lookup(n, `/${r.total}`).catch(() => []), r.total); if (got.length) { cards = got; break; } }
-    }
-    if (!cards.length) cards = weak;
+    showDebug();
+    if (!cards.length) { status("Couldn't read that card. Fill the frame, use even light, avoid glare, or use search. (See “What I read” below.)"); return; }
     showCards(cards, "Check it's the right card, then tap Add. Wrong? Use search below.");
   } catch (e) {
     status(e.message === "no-server" ? "Scanning isn't set up yet. Use search for now." : `Scan failed: ${e.message}`);
