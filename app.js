@@ -306,7 +306,9 @@ async function readCard(card) {
   return { names, ...num, conf: topRes.confidence, raw: { top, bottom } };
 }
 
-const plausible = (r) => !!(r.number && r.total) || (r.conf >= 45 && r.names.some((n) => n.replace(/[^A-Za-z]/g, "").length >= 4));
+/** words printed on cards that are never the card's name */
+const GENERIC = /^(stage\s*\d?|basic|evolves|from|put|card|pok[eé]mon|restored|trainer|energy|supporters?|items?|tools?|stadium|special|the|and|your|you)\W*$/i;
+const plausible = (r) => !!(r.number && r.total) || (r.conf >= 45 && r.names.some((n) => !GENERIC.test(n) && n.replace(/[^A-Za-z]/g, "").length >= 3));
 
 /** Yields plausible reads, trying the detected card crop then the whole photo, upright then rotated. */
 async function* ocrReads(file) {
@@ -330,8 +332,8 @@ async function* ocrReads(file) {
 async function resolveRead(r) {
   // Try whole lines first, then single words (OCR often glues "Stage 2 ... Charizard HP" together), accepting a hit
   // only if its set size matches the printed total; fall back to a number+total search ranked by name similarity.
-  const STOP = new Set(["stage", "basic", "evolves", "from", "put", "card", "pokemon", "pokémon", "restored", "trainer", "energy"]);
-  const words = [...new Set(r.names.flatMap((l) => l.split(" ")).map((w) => w.replace(/[^A-Za-zÀ-ÿ'’.-]/g, "")).filter((w) => w.length >= 4 && !STOP.has(w.toLowerCase())))];
+  // 3+ letters so short Trainer names like "Hop" or "Lisia" survive
+  const words = [...new Set(r.names.flatMap((l) => l.split(" ")).map((w) => w.replace(/[^A-Za-zÀ-ÿ'’.-]/g, "")).filter((w) => w.length >= 3 && !GENERIC.test(w)))];
   const guesses = [...r.names.slice(0, 2), ...words].slice(0, 7);
   const numArg = r.total ? `${r.number}/${r.total}` : r.number;
   let cards = [], weak = [];
@@ -345,7 +347,17 @@ async function resolveRead(r) {
   if (!cards.length && r.total) { // number unreadable: name + set size
     for (const n of guesses.slice(0, 3)) { const got = sameTotal(await lookup(n, `/${r.total}`).catch(() => []), r.total); if (got.length) { cards = got; break; } }
   }
-  return cards.length ? cards : weak;
+  let out = cards.length ? cards : weak;
+  // Cross-check: a number-led match whose name disagrees with the name we read is probably a misread number. Trust the name.
+  const clean = r.names.filter((n) => !GENERIC.test(n)).concat(words);
+  const score = (cs) => (cs.length ? nameScore(cs[0].name, clean) : 0);
+  if (clean.length && score(out) < 0.6) {
+    for (const n of words.slice(0, 4)) {
+      const alt = byScore(await lookup(n, "").catch(() => []), clean);
+      if (alt.length && score(alt) >= 0.8) { out = sameTotal(alt, r.total); break; }
+    }
+  }
+  return { cards: out, sure: !clean.length || score(out) >= 0.6 };
 }
 
 function showDebug() {
@@ -431,15 +443,17 @@ async function onPhoto(file) {
       return;
     }
     status(ocrWorker ? "Reading card…" : "Reading card… (the first scan downloads the text reader, about 10 MB)");
-    let cards = [];
+    let cards = [], sure = true, read = "";
     for await (const r of ocrReads(file)) {
-      status(`Read: ${r.names[0] || "?"} ${r.number ? r.number + (r.total ? "/" + r.total : "") : ""}. Looking up…`);
-      cards = await resolveRead(r);
+      const nm = r.names.find((n) => !GENERIC.test(n)) || "?";
+      read = `${nm} ${r.number ? r.number + (r.total ? "/" + r.total : "") : ""}`.trim();
+      status(`Read: ${read}. Looking up…`);
+      ({ cards, sure } = await resolveRead(r));
       if (cards.length) break;
     }
     showDebug();
     if (!cards.length) { status("Couldn't read that card. Fill the frame, use even light, avoid glare, or use search. (See “What I read” below.)"); return; }
-    showCards(cards, "Check it's the right card, then tap Add. Wrong? Use search below.");
+    showCards(cards, sure ? `Read “${read}”. Check it's the right card, then tap Add.` : `Not sure: I read “${read}” but the best match may be wrong. Compare the picture with your card, or use search.`);
   } catch (e) {
     status(e.message === "no-server" ? "Scanning isn't set up yet. Use search for now." : `Scan failed: ${e.message}`);
   } finally { scanning = false; }
