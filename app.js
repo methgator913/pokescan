@@ -7,7 +7,9 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* private mode etc. */ } },
 };
 let collection = store.get("collection", []);
+const DEFAULT_SCAN_URL = "https://pokescan-id.lukablum123.workers.dev"; // Gemini scanner; the app falls back to on-phone OCR if it isn't reachable
 let settings = store.get("settings", { url: "", token: "" });
+if (!settings.url) settings.url = DEFAULT_SCAN_URL;
 let finish = store.get("finish", { holo: false, reverse: false, first: false });
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -434,13 +436,22 @@ async function onPhoto(file) {
   scanning = true;
   $("#results").innerHTML = "";
   try {
-    if (settings.url) { // optional Claude scanner
+    if (settings.url) { // Gemini via our Worker; if it fails (no key yet, quota, offline) fall through to the on-phone reader
       status("Reading card…");
-      const r = await identify(file);
-      if (!r.name) { status("Couldn't read that card. Try again with less glare, or use search."); return; }
-      status(`Looks like ${r.name}${r.number ? " " + r.number : ""}…`);
-      showCards(await lookup(r.name, r.number), r.confidence === "low" ? "Not sure about this one. Check it's the right card." : "Tap Add on the right one.");
-      return;
+      try {
+        const g = await identify(file);
+        if (g.name) {
+          const n = parseNumber(g.number || "");
+          const label = `${g.name} ${g.number || ""}`.trim();
+          status(`Read: ${label}. Looking up…`);
+          const { cards, sure } = await resolveRead({ names: [g.name], number: n.number, total: n.total, conf: 90 });
+          if (cards.length) {
+            showCards(cards, sure && g.confidence !== "low" ? `Read “${label}”. Check it's the right card, then tap Add.` : `Not sure: I read “${label}” but the best match may be wrong. Compare the picture with your card, or use search.`);
+            return;
+          }
+        }
+      } catch (e) { /* fall back to OCR */ }
+      status("Trying the on-phone reader…");
     }
     status(ocrWorker ? "Reading card…" : "Reading card… (the first scan downloads the text reader, about 10 MB)");
     let cards = [], sure = true, read = "";
