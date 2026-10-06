@@ -2,6 +2,10 @@ name = "pokescan-id"
 main = "worker.js"
 compatibility_date = "2026-10-01"
 
+# Cloudflare Workers AI (vision models). Free daily allowance; over it, calls error instead of charging.
+[ai]
+binding = "AI"
+
 [vars]
-# Only the hosted page may call this Worker.
-ALLOWED_ORIGIN = "https://methgator913.github.io"
+# Only these pages may call this Worker (comma-separated). localhost is for testing the app locally.
+ALLOWED_ORIGIN = "https://methgator913.github.io,http://localhost:8123"

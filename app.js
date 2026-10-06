@@ -7,8 +7,9 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* private mode etc. */ } },
 };
 let collection = store.get("collection", []);
-// Optional Gemini scanner (worker/worker.js). Empty = on-phone OCR only. Put https://pokescan-id.lukablum123.workers.dev here, or in Scanner settings, once Gemini has credit.
-const DEFAULT_SCAN_URL = "";
+// AI scanner (worker/worker.js: Cloudflare Workers AI vision, free daily allowance). The app falls back to on-phone OCR
+// if it errors (offline, over the daily limit). Empty = on-phone OCR only.
+const DEFAULT_SCAN_URL = "https://pokescan-id.lukablum123.workers.dev";
 let settings = store.get("settings", { url: "", token: "" });
 if (!settings.url) settings.url = DEFAULT_SCAN_URL;
 let finish = store.get("finish", { holo: false, reverse: false, first: false });
@@ -133,26 +134,28 @@ function parseTyped(text) {
   return m ? { name: m[1], number: m[2] } : { name: t, number: "" };
 }
 
-/* ---------- photo -> Claude id ---------- */
-async function downscale(file, max = 1000) {
-  const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
-  const k = Math.min(1, max / Math.max(bmp.width, bmp.height));
-  const c = document.createElement("canvas");
-  c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
-  c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
-  return c.toDataURL("image/jpeg", 0.85).split(",")[1];
-}
+/* ---------- photo -> AI scanner (our Worker) ---------- */
+let aiNote = ""; // what the AI said or why it failed; shown in "What I read"
 
+/** Send the cropped, straightened card (not the whole photo) so the small collector number stays legible. */
 async function identify(file) {
   if (!settings.url) throw new Error("no-server");
-  const image = await downscale(file);
+  const page = await loadPage(file, 1600);
+  const card = detectCard(page) || page;
+  const k = Math.min(1, 1000 / Math.max(card.width, card.height));
+  const c = document.createElement("canvas");
+  c.width = Math.round(card.width * k); c.height = Math.round(card.height * k);
+  c.getContext("2d").drawImage(card, 0, 0, c.width, c.height);
+  window.scanDebug = { found: card !== page, tries: [], img: c, size: `${page.width}x${page.height}`, late: false };
   const res = await fetch(settings.url, {
     method: "POST",
     headers: { "content-type": "application/json", ...(settings.token ? { "x-app-token": settings.token } : {}) },
-    body: JSON.stringify({ image, hints: finish }),
+    body: JSON.stringify({ image: c.toDataURL("image/jpeg", 0.88).split(",")[1], hints: finish }),
+    signal: AbortSignal.timeout(30000),
   });
-  if (!res.ok) throw new Error(`Scan server ${res.status}`);
-  return res.json(); // { name, number, confidence }
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`scan server ${res.status}${out.tried ? ": " + out.tried.join(" | ") : ""}`);
+  return out; // { name, number, confidence, model }
 }
 
 /* ---------- photo -> free on-phone OCR (Tesseract.js) ---------- */
@@ -383,7 +386,7 @@ async function* ocrReads(file) {
   const t0 = Date.now(), deadline = t0 + 75000;
   const page = await loadPage(file);
   const card = detectCard(page);
-  const dbg = (window.scanDebug = { found: !!card, tries: [], img: (card || page), size: `${page.width}x${page.height}`, late: false });
+  const dbg = (window.scanDebug = { found: !!card, tries: aiNote ? [aiNote] : [], img: (card || page), size: `${page.width}x${page.height}`, late: false });
   let n = 0;
   for (const base of card ? [card, page] : [page]) {
     const rots = base.width > base.height ? [90, 270] : [0];
@@ -507,21 +510,25 @@ async function onPhoto(file) {
   scanning = true;
   $("#results").innerHTML = "";
   try {
-    if (settings.url) { // Gemini via our Worker; if it fails (no key yet, quota, offline) fall through to the on-phone reader
+    if (settings.url) { // AI via our Worker; if it fails (offline, over the free daily limit) fall through to the on-phone reader
       status("Reading card…");
+      aiNote = "";
       try {
         const g = await identify(file);
+        aiNote = `AI (${(g.model || "").split("/").pop()}): name=${g.name} number=${g.number} confidence=${g.confidence}`;
+        window.scanDebug.tries.push(aiNote);
         if (g.name) {
           const n = parseNumber(g.number || "");
           const label = `${g.name} ${g.number || ""}`.trim();
           status(`Read: ${label}. Looking up…`);
           const { cards, sure } = await resolveRead({ names: [g.name], number: n.number, total: n.total, conf: 90 });
           if (cards.length) {
+            showDebug();
             showCards(cards, sure && g.confidence !== "low" ? `Read “${label}”. Check it's the right card, then tap Add.` : `Not sure: I read “${label}” but the best match may be wrong. Compare the picture with your card, or use search.`);
             return;
           }
         }
-      } catch (e) { /* fall back to OCR */ }
+      } catch (e) { aiNote = `AI failed: ${String(e.message || e).slice(0, 200)}`; }
       status("Trying the on-phone reader…");
     }
     status(ocrWorker ? "Reading card…" : "Reading card… (the first scan downloads the text reader, about 10 MB)");
