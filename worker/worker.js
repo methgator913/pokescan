@@ -20,8 +20,9 @@ function parseReply(raw) {
   try { return JSON.parse(m[0]); } catch { return null; }
 }
 
-async function viaWorkersAI(env, image, text, tried) {
-  for (const model of env.CF_MODEL ? [env.CF_MODEL] : CF_MODELS) {
+async function viaWorkersAI(env, image, text, tried, alt) {
+  // alt = a second opinion from a different model when the app couldn't match the first answer to a card
+  for (const model of env.CF_MODEL ? [env.CF_MODEL] : alt ? CF_MODELS.slice(1) : CF_MODELS) {
     try {
       const out = await env.AI.run(model, {
         messages: [{ role: "user", content: [
@@ -86,7 +87,7 @@ export default {
     const tried = [];
     const result =
       (env.USE_GEMINI === "1" && env.GEMINI_API_KEY ? await viaGemini(env, body.image, text, tried) : null) ||
-      (env.AI ? await viaWorkersAI(env, body.image, text, tried) : null);
+      (env.AI ? await viaWorkersAI(env, body.image, text, tried, !!body.alt) : null);
     return result ? json(result) : json({ error: "no model could read it", tried }, 502);
   },
 };

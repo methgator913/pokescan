@@ -137,20 +137,53 @@ function parseTyped(text) {
 /* ---------- photo -> AI scanner (our Worker) ---------- */
 let aiNote = ""; // what the AI said or why it failed; shown in "What I read"
 
-/** Send the cropped, straightened card (not the whole photo) so the small collector number stays legible. */
-async function identify(file) {
-  if (!settings.url) throw new Error("no-server");
-  const page = await loadPage(file, 1600);
+/** Stretch each colour channel so its darkest 1% goes black and brightest 1% white, then sharpen a little.
+ *  Dim indoor photos of dark text on coloured cards (black on blue Water/Item cards) read far better afterwards. */
+function enhance(c) {
+  const g = c.getContext("2d", { willReadFrequently: true });
+  const im = g.getImageData(0, 0, c.width, c.height), d = im.data, n = c.width * c.height;
+  for (let ch = 0; ch < 3; ch++) {
+    const hist = new Uint32Array(256);
+    for (let i = ch; i < d.length; i += 4) hist[d[i]]++;
+    let lo = 0, hi = 255, acc = 0;
+    while (lo < 255 && (acc += hist[lo]) < n * 0.01) lo++;
+    acc = 0; while (hi > 0 && (acc += hist[hi]) < n * 0.01) hi--;
+    if (hi - lo < 10) continue;
+    const k = 255 / (hi - lo);
+    for (let i = ch; i < d.length; i += 4) d[i] = Math.max(0, Math.min(255, (d[i] - lo) * k));
+  }
+  const w = c.width, h = c.height, src = new Uint8ClampedArray(d), s = 0.35; // mild 3x3 sharpen
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const o = (y * w + x) * 4;
+    for (let ch = 0; ch < 3; ch++) {
+      const i = o + ch;
+      d[i] = src[i] * (1 + 4 * s) - s * (src[i - 4] + src[i + 4] + src[i - w * 4] + src[i + w * 4]);
+    }
+  }
+  g.putImageData(im, 0, 0);
+  return c;
+}
+
+/** Crop + straighten the card (the small collector number must stay legible), scale to 1400px, enhance. */
+async function prepareForAI(file) {
+  const page = await loadPage(file, 2000);
   const card = detectCard(page) || page;
-  const k = Math.min(1, 1000 / Math.max(card.width, card.height));
+  const k = Math.min(1, 1400 / Math.max(card.width, card.height));
   const c = document.createElement("canvas");
   c.width = Math.round(card.width * k); c.height = Math.round(card.height * k);
   c.getContext("2d").drawImage(card, 0, 0, c.width, c.height);
+  enhance(c);
   window.scanDebug = { found: card !== page, tries: [], img: c, size: `${page.width}x${page.height}`, late: false };
+  return c.toDataURL("image/jpeg", 0.88).split(",")[1];
+}
+
+/** alt = ask the Worker's second-opinion model. */
+async function identify(image, alt = false) {
+  if (!settings.url) throw new Error("no-server");
   const res = await fetch(settings.url, {
     method: "POST",
     headers: { "content-type": "application/json", ...(settings.token ? { "x-app-token": settings.token } : {}) },
-    body: JSON.stringify({ image: c.toDataURL("image/jpeg", 0.88).split(",")[1], hints: finish }),
+    body: JSON.stringify({ image, hints: finish, alt }),
     signal: AbortSignal.timeout(30000),
   });
   const out = await res.json().catch(() => ({}));
@@ -433,7 +466,8 @@ async function resolveRead(r) {
     }
   }
   const haveNum = !!(r.number && r.total);
-  return { cards: out, sure: haveNum ? (!clean.length || score(out) >= 0.6) : (r.conf >= 60 && score(out) >= 0.85) };
+  // without a number the name can't tell printings apart, so only call it sure when there's exactly one candidate
+  return { cards: out, sure: haveNum ? (!clean.length || score(out) >= 0.6) : (r.conf >= 60 && score(out) >= 0.85 && out.length === 1) };
 }
 
 function showDebug() {
@@ -514,19 +548,28 @@ async function onPhoto(file) {
       status("Reading card…");
       aiNote = "";
       try {
-        const g = await identify(file);
-        aiNote = `AI (${(g.model || "").split("/").pop()}): name=${g.name} number=${g.number} confidence=${g.confidence}`;
-        window.scanDebug.tries.push(aiNote);
-        if (g.name) {
+        const image = await prepareForAI(file);
+        const ask = async (alt) => {
+          const g = await identify(image, alt);
+          const note = `AI${alt ? " 2nd opinion" : ""} (${(g.model || "").split("/").pop()}): name=${g.name} number=${g.number} confidence=${g.confidence}`;
+          window.scanDebug.tries.push(note); aiNote = note;
+          if (!g.name) return { cards: [], sure: false, g };
           const n = parseNumber(g.number || "");
-          const label = `${g.name} ${g.number || ""}`.trim();
-          status(`Read: ${label}. Looking up…`);
-          const { cards, sure } = await resolveRead({ names: [g.name], number: n.number, total: n.total, conf: 90 });
-          if (cards.length) {
-            showDebug();
-            showCards(cards, sure && g.confidence !== "low" ? `Read “${label}”. Check it's the right card, then tap Add.` : `Not sure: I read “${label}” but the best match may be wrong. Compare the picture with your card, or use search.`);
-            return;
-          }
+          status(`Read: ${g.name} ${g.number || ""}. Looking up…`);
+          const r = await resolveRead({ names: [g.name], number: n.number, total: n.total, conf: 90 });
+          return { ...r, sure: r.sure && g.confidence !== "low", g };
+        };
+        let best = await ask(false);
+        if (!best.cards.length || !best.sure) {
+          status("Getting a second opinion…");
+          const second = await ask(true).catch(() => null);
+          if (second && second.cards.length && (second.sure || !best.cards.length)) best = second;
+        }
+        if (best.cards.length) {
+          const label = `${best.g.name} ${best.g.number || ""}`.trim();
+          showDebug();
+          showCards(best.cards, best.sure ? `Read “${label}”. Check it's the right card, then tap Add.` : `Not sure: I read “${label}” but the best match may be wrong. Compare the picture with your card, or use search.`);
+          return;
         }
       } catch (e) { aiNote = `AI failed: ${String(e.message || e).slice(0, 200)}`; }
       status("Trying the on-phone reader…");
