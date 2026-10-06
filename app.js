@@ -156,19 +156,23 @@ async function identify(file) {
 }
 
 /* ---------- photo -> free on-phone OCR (Tesseract.js) ---------- */
-let ocrWorker;
-async function getOcr() {
-  if (ocrWorker) return ocrWorker;
-  if (!window.Tesseract) {
-    await new Promise((ok, fail) => {
-      const s = document.createElement("script");
-      s.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
-      s.onload = ok; s.onerror = () => fail(new Error("couldn't load the text reader (offline?)"));
-      document.head.appendChild(s);
-    });
-  }
-  ocrWorker = await Tesseract.createWorker("eng");
-  return ocrWorker;
+let ocrWorker, ocrLoading;
+/** One shared Tesseract worker. Concurrent callers (the warm-up on app open and a scan) wait on the same load. */
+function getOcr() {
+  if (ocrWorker) return Promise.resolve(ocrWorker);
+  ocrLoading = ocrLoading || (async () => {
+    if (!window.Tesseract) {
+      await new Promise((ok, fail) => {
+        const sc = document.createElement("script");
+        sc.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+        sc.onload = ok; sc.onerror = () => fail(new Error("couldn't load the text reader (offline?)"));
+        document.head.appendChild(sc);
+      });
+    }
+    ocrWorker = await Tesseract.createWorker("eng");
+    return ocrWorker;
+  })().catch((e) => { ocrLoading = null; throw e; }); // a failed load can be retried by the next scan
+  return ocrLoading;
 }
 
 /** Crop a band of the card, grayscale + stretch contrast, upscale: small printed text reads far better. */
@@ -371,21 +375,26 @@ const GENERIC = /^(stage\s*\d?|basic|evolves|from|put|card|pok[eé]mon|restored|
 const plausible = (r) => !!(r.number && r.total) || (r.conf >= 60 && r.names.some((n) => !GENERIC.test(n) && n.replace(/[^A-Za-z]/g, "").length >= 4));
 
 /** Yields plausible reads: the detected card first, then the whole photo; rotated only when a crop is landscape.
- *  Stops starting new attempts after ~35 s so a hopeless photo fails in reasonable time. */
+ *  The time budget starts only after the text reader has loaded (its first download can be slow on mobile), and stops
+ *  new attempts after ~75 s so a hopeless photo fails in reasonable time. */
 async function* ocrReads(file) {
+  if (!ocrWorker) status("Loading the text reader (first time only, about 10 MB)…");
+  await getOcr();
+  const t0 = Date.now(), deadline = t0 + 75000;
   const page = await loadPage(file);
   const card = detectCard(page);
-  const dbg = (window.scanDebug = { found: !!card, tries: [], img: (card || page) });
-  const deadline = Date.now() + 35000;
+  const dbg = (window.scanDebug = { found: !!card, tries: [], img: (card || page), size: `${page.width}x${page.height}`, late: false });
   let n = 0;
   for (const base of card ? [card, page] : [page]) {
     const rots = base.width > base.height ? [90, 270] : [0];
     for (const rot of rots) {
-      if (Date.now() > deadline) return;
+      if (Date.now() > deadline) { dbg.late = true; return; }
       status(`Reading card… (try ${++n})`);
+      const ta = Date.now();
       const r = await readCard(rot ? rotate(base, rot) : base, deadline);
       r.rot = rot; r.crop = base === card ? "card" : "photo";
-      dbg.tries.push(`#${n} ${r.crop} rot${rot} conf${Math.round(r.conf)} names=[${r.names.slice(0, 2).join(" // ")}] num=${r.number}/${r.total}`);
+      if (Date.now() > deadline) dbg.late = true;
+      dbg.tries.push(`#${n} ${r.crop} ${base.width}x${base.height} rot${rot} ${Math.round((Date.now() - ta) / 1000)}s conf${Math.round(r.conf)} names=[${r.names.slice(0, 2).join(" // ")}] num=${r.number}/${r.total}`);
       if (plausible(r)) { window.lastOcr = r; yield r; }
     }
   }
@@ -428,7 +437,7 @@ function showDebug() {
   const d = window.scanDebug; if (!d) return;
   const box = $("#dbg"); box.hidden = false;
   const img = $("#dbg-img"); img.innerHTML = ""; d.img.style.cssText = "max-width:140px;border-radius:6px;display:block;margin:8px 0"; img.appendChild(d.img);
-  $("#dbg-txt").textContent = `card found in photo: ${d.found}\n` + d.tries.join("\n");
+  $("#dbg-txt").textContent = `photo ${d.size}, card found: ${d.found}${d.late ? ", RAN OUT OF TIME" : ""}\n` + d.tries.join("\n");
 }
 
 function similarity(a, b) {
@@ -525,7 +534,12 @@ async function onPhoto(file) {
       if (cards.length) break;
     }
     showDebug();
-    if (!cards.length) { status("Couldn't read that card. Fill the frame, use even light, avoid glare, or use search. (See “What I read” below.)"); return; }
+    if (!cards.length) {
+      $("#dbg").open = true;
+      const d = window.scanDebug;
+      status(d?.late ? "That took too long and I gave up. Try again (it's faster once the reader has loaded), or use search." : "Couldn't read that card. I've put what I saw under “What I read” below. Try again closer and straight-on, or use search.");
+      return;
+    }
     showCards(cards, sure ? `Read “${read}”. Check it's the right card, then tap Add.` : `Not sure: I read “${read}” but the best match may be wrong. Compare the picture with your card, or use search.`);
   } catch (e) {
     status(e.message === "no-server" ? "Scanning isn't set up yet. Use search for now." : `Scan failed: ${e.message}`);
@@ -617,3 +631,6 @@ document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click
 
 renderCollection();
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+
+// Start loading the text reader in the background so the first scan doesn't pay for the download.
+if (!settings.url) setTimeout(() => getOcr().catch(() => {}), 1500);
