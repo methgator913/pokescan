@@ -7,7 +7,8 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* private mode etc. */ } },
 };
 let collection = store.get("collection", []);
-const DEFAULT_SCAN_URL = "https://pokescan-id.lukablum123.workers.dev"; // Gemini scanner; the app falls back to on-phone OCR if it isn't reachable
+// Optional Gemini scanner (worker/worker.js). Empty = on-phone OCR only. Put https://pokescan-id.lukablum123.workers.dev here, or in Scanner settings, once Gemini has credit.
+const DEFAULT_SCAN_URL = "";
 let settings = store.get("settings", { url: "", token: "" });
 if (!settings.url) settings.url = DEFAULT_SCAN_URL;
 let finish = store.get("finish", { holo: false, reverse: false, first: false });
@@ -82,7 +83,13 @@ const list = async (params) => (await getJSON(`${DEX}/cards?${new URLSearchParam
 /** How well a card name matches the OCR'd / typed guesses (a guess that contains the whole card name is a perfect hit). */
 function nameScore(cardName, guesses) {
   const cn = cardName.toLowerCase();
-  return Math.max(0, ...guesses.map((g) => (g && g.toLowerCase().includes(cn) ? 1 : similarity(cn, g || ""))));
+  return Math.max(0, ...guesses.map((g) => {
+    const gl = (g || "").toLowerCase();
+    if (!gl) return 0;
+    if (gl.includes(cn)) return 1;
+    if (gl.length >= 4 && gl.length >= cn.length * 0.5 && cn.includes(gl)) return 0.9; // "Center Lady" in "Pokémon Center Lady", but not "allen" in "Challenge"
+    return similarity(cn, gl);
+  }));
 }
 const byScore = (cards, guesses) => cards.map((c) => [nameScore(c.name, guesses), c]).sort((a, b) => b[0] - a[0]).map((x) => x[1]);
 /** Prefer cards from a set of the printed size; OCR sometimes drops a trailing digit ("14" for 146), so accept a prefix match too. */
@@ -188,8 +195,8 @@ const cleanName = (line) => line
 
 function parseNumber(text) {
   for (const t of [text, text.replace(/[Oo]/g, "0").replace(/[Il|]/g, "1")]) {
-    let m = t.match(/\b(\d{1,3}[A-Za-z]?)\s*[\/7]\s*(\d{2,3})\b/); // 025/165
-    if (m) return { number: m[1].toUpperCase(), total: m[2] };
+    let m = t.match(/\b(\d{1,3}[A-Za-z]?)\s*\/\s*(\d{2,3})\b/) || t.match(/\b(\d{1,3}[A-Za-z]?)\s*7\s*(\d{2,3})\b/); // 025/165 (a "7" is OCR's usual misread of the slash)
+    if (m && +m[1] > 0) return { number: m[1].toUpperCase(), total: m[2] };
     m = t.match(/\b([A-Za-z]{1,4}\d{1,3})\s*\/\s*([A-Za-z]{1,4}\d{1,3})\b/); // TG05/TG30, GG01/GG70
     if (m) return { number: m[1].toUpperCase(), total: m[2].replace(/\D/g, "") };
     m = t.match(/\b((?:SWSH|SVP|SM|XY|BW|DP|HGSS|SV|PR)\d{2,3})\b/i); // promos print no total
@@ -282,47 +289,101 @@ function detectCard(page, depth = 0) {
   return out;
 }
 
-/** Read name (top band) and collector number (bottom bands) off an upright card image. */
-async function readCard(card) {
-  const w = await getOcr();
-  await w.setParameters({ tessedit_pageseg_mode: "6", tessedit_char_whitelist: "" });
-  const topRes = (await w.recognize(prep(card, 0.04, 0.02, 0.92, 0.13, 140))).data;
-  const top = topRes.text;
-  const lines = top.split("\n");
-  const names = lines.map(cleanName).filter((l) => (l.match(/[A-Za-z]/g) || []).length >= 3);
-  // Evolved cards print "Put <Name> on the Stage N card" in the flavor line: that is the real name.
-  const put = top.match(/Put\s+([A-Z][A-Za-zÀ-ÿ'’.\-]+(?:\s+(?:ex|EX|GX|V|VMAX))?)\s+on\s+the/);
-  if (put) names.unshift(put[1]);
-  // wrong way up / not a card: the top band is garbage, so don't waste time on the rest
-  if (!put && topRes.confidence < 40 && !names.some((n) => n.replace(/[^A-Za-z]/g, "").length >= 5)) return { names: [], number: "", total: "", conf: topRes.confidence, raw: { top, bottom: "" } };
-
-  await w.setParameters({ tessedit_pageseg_mode: "6", tessedit_char_whitelist: "0123456789/ABCDEFGHIJKLMNOPQRSTUVWXYZ " });
-  // The collector number is small and its spot varies by era: try the whole bottom band, then tighter bands per side.
-  let bottom = "", num = { number: "", total: "" };
-  for (const [x, y, bw, bh] of [[0, 0.88, 1, 0.12], [0, 0.915, 0.5, 0.08], [0.5, 0.915, 0.5, 0.08], [0, 0.93, 1, 0.065]]) {
-    const t = (await w.recognize(prep(card, x, y, bw, bh, 120))).data.text;
-    bottom += t + "\n";
-    num = parseNumber(t);
-    if (num.number && num.total) break;
+/** Pull text off busy art: compare each pixel with its local average. mode "dark" keeps pixels darker than their
+ *  surroundings (dark print), "light" keeps lighter ones (white text over art). Output is black text on white. */
+function binarize(src, mode) {
+  const w = src.width, h = src.height, g = src.getContext("2d", { willReadFrequently: true });
+  const im = g.getImageData(0, 0, w, h), d = im.data, gray = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) gray[i] = d[i * 4] * 0.3 + d[i * 4 + 1] * 0.59 + d[i * 4 + 2] * 0.11;
+  const I = new Float64Array((w + 1) * (h + 1));
+  for (let y = 1; y <= h; y++) { let row = 0; for (let x = 1; x <= w; x++) { row += gray[(y - 1) * w + x - 1]; I[y * (w + 1) + x] = I[(y - 1) * (w + 1) + x] + row; } }
+  const r = Math.max(8, Math.round(h / 4));
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1), y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1);
+    const mean = (I[y1 * (w + 1) + x1] - I[y0 * (w + 1) + x1] - I[y1 * (w + 1) + x0] + I[y0 * (w + 1) + x0]) / ((x1 - x0) * (y1 - y0));
+    const v = gray[y * w + x], ink = mode === "dark" ? v < mean - 14 : v > mean + 14, o = (y * w + x) * 4;
+    d[o] = d[o + 1] = d[o + 2] = ink ? 0 : 255;
   }
-  return { names, ...num, conf: topRes.confidence, raw: { top, bottom } };
+  g.putImageData(im, 0, 0);
+  return src;
+}
+const copyCanvas = (c) => { const o = document.createElement("canvas"); o.width = c.width; o.height = c.height; o.getContext("2d").drawImage(c, 0, 0); return o; };
+
+async function recog(w, canvas, psm, whitelist = "") {
+  await w.setParameters({ tessedit_pageseg_mode: String(psm), tessedit_char_whitelist: whitelist });
+  return (await w.recognize(canvas)).data;
+}
+
+/** Read the collector number and the name off an upright card image.
+ *  The number comes first: number + set size almost always pins the card down, so the name is only a tiebreaker.
+ *  Plain print is tried first; if that fails (full arts: text sits on artwork) we retry through dark/light text filters. */
+async function readCard(card, deadline = Infinity) {
+  const w = await getOcr();
+  const NUM = "0123456789/ABCDEFGHIJKLMNOPQRSTUVWXYZ ";
+  const usable = (n) => !GENERIC.test(n) && n.replace(/[^A-Za-z]/g, "").length >= 4;
+  const toNames = (text) => text.split("\n").map(cleanName).filter((l) => (l.match(/[A-Za-z]/g) || []).length >= 3);
+  const late = () => Date.now() > deadline;
+
+  // ---- collector number ----
+  let bottom = "", num = { number: "", total: "" };
+  const numAttempts = [
+    [0, 0.88, 1, 0.12, 6, 120, null],            // whole bottom band, plain (works for most cards)
+    [0, 0.925, 0.45, 0.065, 7, 90, null],        // tight bottom-left line (modern cards)
+    [0, 0.925, 0.45, 0.065, 7, 90, "light"],     // ...white text over art
+    [0, 0.925, 0.45, 0.065, 7, 90, "dark"],
+    [0.55, 0.925, 0.45, 0.065, 7, 90, null],     // tight bottom-right (older cards)
+    [0, 0.88, 1, 0.12, 6, 120, "light"],
+    [0, 0.88, 1, 0.12, 6, 120, "dark"],
+  ];
+  for (const [x, y, bw, bh, psm, minH, variant] of numAttempts) {
+    if (late()) break;
+    const base = prep(card, x, y, bw, bh, minH);
+    const t = (await recog(w, variant ? binarize(copyCanvas(base), variant) : base, psm, NUM)).text;
+    bottom += t + "\n";
+    const n = parseNumber(t);
+    if (n.number && n.total) { num = n; break; }
+    if (!num.number && n.number) num = n;
+  }
+  const haveNum = !!(num.number && num.total);
+
+  // ---- name: one plain read if we already have the number; otherwise try the filters too ----
+  let names = [], conf = 0, top = "", put = null;
+  const nameBands = [[0.04, 0.02, 0.92, 0.13, 6, 140], [0.04, 0.03, 0.62, 0.085, 7, 110]];
+  nameLoop: for (const [x, y, bw, bh, psm, minH] of nameBands) {
+    const base = prep(card, x, y, bw, bh, minH);
+    for (const variant of [null, "dark", "light"]) {
+      if (late()) break nameLoop;
+      const d = await recog(w, variant ? binarize(copyCanvas(base), variant) : base, psm);
+      top += d.text + "\n"; conf = Math.max(conf, d.confidence);
+      for (const n of toNames(d.text)) if (!names.includes(n)) names.push(n);
+      put = put || d.text.match(/Put\s+([A-Z][A-Za-zÀ-ÿ'’.\-]+(?:\s+(?:ex|EX|GX|V|VMAX))?)\s+on\s+the/);
+      // stop at the first usable name; with a solid number we accept a shakier one since it is only a tiebreaker
+      if (put || (toNames(d.text).some(usable) && (d.confidence >= 60 || haveNum))) break nameLoop;
+    }
+  }
+  names = names.slice(0, 6);
+  if (put) names.unshift(put[1]);
+  return { names, ...num, conf, raw: { top, bottom } };
 }
 
 /** words printed on cards that are never the card's name */
 const GENERIC = /^(stage\s*\d?|basic|evolves|from|put|card|pok[eé]mon|restored|trainer|energy|supporters?|items?|tools?|stadium|special|the|and|your|you)\W*$/i;
-const plausible = (r) => !!(r.number && r.total) || (r.conf >= 45 && r.names.some((n) => !GENERIC.test(n) && n.replace(/[^A-Za-z]/g, "").length >= 3));
+const plausible = (r) => !!(r.number && r.total) || (r.conf >= 60 && r.names.some((n) => !GENERIC.test(n) && n.replace(/[^A-Za-z]/g, "").length >= 4));
 
-/** Yields plausible reads, trying the detected card crop then the whole photo, upright then rotated. */
+/** Yields plausible reads: the detected card first, then the whole photo; rotated only when a crop is landscape.
+ *  Stops starting new attempts after ~35 s so a hopeless photo fails in reasonable time. */
 async function* ocrReads(file) {
   const page = await loadPage(file);
   const card = detectCard(page);
   const dbg = (window.scanDebug = { found: !!card, tries: [], img: (card || page) });
+  const deadline = Date.now() + 35000;
   let n = 0;
   for (const base of card ? [card, page] : [page]) {
-    const rots = base.width > base.height ? [90, 270, 0] : [0, 90, 270];
+    const rots = base.width > base.height ? [90, 270] : [0];
     for (const rot of rots) {
+      if (Date.now() > deadline) return;
       status(`Reading card… (try ${++n})`);
-      const r = await readCard(rot ? rotate(base, rot) : base);
+      const r = await readCard(rot ? rotate(base, rot) : base, deadline);
       r.rot = rot; r.crop = base === card ? "card" : "photo";
       dbg.tries.push(`#${n} ${r.crop} rot${rot} conf${Math.round(r.conf)} names=[${r.names.slice(0, 2).join(" // ")}] num=${r.number}/${r.total}`);
       if (plausible(r)) { window.lastOcr = r; yield r; }
@@ -335,7 +396,7 @@ async function resolveRead(r) {
   // Try whole lines first, then single words (OCR often glues "Stage 2 ... Charizard HP" together), accepting a hit
   // only if its set size matches the printed total; fall back to a number+total search ranked by name similarity.
   // 3+ letters so short Trainer names like "Hop" or "Lisia" survive
-  const words = [...new Set(r.names.flatMap((l) => l.split(" ")).map((w) => w.replace(/[^A-Za-zÀ-ÿ'’.-]/g, "")).filter((w) => w.length >= 3 && !GENERIC.test(w)))];
+  const words = [...new Set(r.names.flatMap((l) => l.split(" ")).map((w) => w.replace(/[^A-Za-zÀ-ÿ'’.-]/g, "")).filter((w) => w.length >= (r.conf >= 60 ? 3 : 4) && !GENERIC.test(w)))];
   const guesses = [...r.names.slice(0, 2), ...words].slice(0, 7);
   const numArg = r.total ? `${r.number}/${r.total}` : r.number;
   let cards = [], weak = [];
@@ -359,7 +420,8 @@ async function resolveRead(r) {
       if (alt.length && score(alt) >= 0.8) { out = sameTotal(alt, r.total); break; }
     }
   }
-  return { cards: out, sure: !clean.length || score(out) >= 0.6 };
+  const haveNum = !!(r.number && r.total);
+  return { cards: out, sure: haveNum ? (!clean.length || score(out) >= 0.6) : (r.conf >= 60 && score(out) >= 0.85) };
 }
 
 function showDebug() {

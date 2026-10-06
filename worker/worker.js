@@ -45,7 +45,7 @@ export default {
       generationConfig: { responseMimeType: "application/json", responseSchema: SCHEMA, temperature: 0, maxOutputTokens: 1024 },
     });
 
-    let last = { status: 502, error: "no model worked" };
+    const tried = [];
     for (const model of env.GEMINI_MODEL ? [env.GEMINI_MODEL] : MODELS) {
       const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
         method: "POST", headers: { "x-goog-api-key": env.GEMINI_API_KEY, "content-type": "application/json" }, body: payload,
@@ -55,9 +55,10 @@ export default {
         const raw = out.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
         try { return json({ ...JSON.parse(raw), model }); } catch { return json({ name: null, number: null, confidence: "low", model }); }
       }
-      last = { status: r.status, error: `gemini ${r.status} on ${model}` };
+      let why = ""; try { why = (await r.json()).error?.message || ""; } catch { /* not json */ }
+      tried.push(`${model}: ${r.status} ${why.slice(0, 160)}`);
       if (r.status === 429 || r.status === 401 || r.status === 403) break; // quota or bad key: another model won't help
     }
-    return json({ error: last.error }, 502);
+    return json({ error: "gemini failed", tried }, 502);
   },
 };
